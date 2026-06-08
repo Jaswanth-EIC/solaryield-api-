@@ -174,6 +174,11 @@ def get_log(n: int = 360):
     return {"count": len(entries), "readings": entries}
 
 # ─── CSV export endpoint ──────────────────────────────────────────────────────
+@app.delete("/clear-log")
+def clear_log():
+    reading_log.clear()
+    save_log_to_disk()
+    return {"status": "log cleared", "entries_remaining": 0}
 @app.get("/export")
 def export_csv():
     """Download full log as CSV for daily backup."""
