@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from twilio.rest import Client
 import io
 import csv
+import urllib.request
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -264,6 +265,18 @@ def predict(data: SensorData):
         "power_mw":         round(data.voltage * data.current, 2),
     }
     reading_log.append(log_entry)
+
+   # Send to Google Sheets
+    try:
+     gs_data = json.dumps(log_entry).encode("utf-8")
+     req = urllib.request.Request(
+        "https://script.google.com/macros/s/AKfycbw2L8MJmkXec7YuZj-H6koqexwdpx66JwFZMx5ZPtqRf-HwCb37dgoUjpD8ZWtT6apE/exec",
+        data=gs_data,
+        headers={"Content-Type": "application/json"}
+     )
+     urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+      logger.error(f"Google Sheets logging failed: {e}")
 
     if len(reading_log) % 60 == 0:
         save_log_to_disk()
