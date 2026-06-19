@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+import numpy as np
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from fastapi import FastAPI
@@ -11,7 +12,23 @@ from pydantic import BaseModel
 from twilio.rest import Client
 import io
 import csv
-import urllib.request
+
+# ─── Try to load RF model bundle ─────────────────────────────────────────────
+# If model_bundle.pkl exists, use RF model
+# If not, fall back to threshold logic automatically
+RF_MODEL_AVAILABLE = False
+model_bundle = None
+
+try:
+    import joblib
+    if os.path.exists("model_bundle.pkl"):
+        model_bundle = joblib.load("model_bundle.pkl")
+        RF_MODEL_AVAILABLE = True
+        logging.info("RF model bundle loaded successfully")
+    else:
+        logging.info("model_bundle.pkl not found — using threshold fallback")
+except Exception as e:
+    logging.error(f"Failed to load RF model: {e}")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -33,12 +50,10 @@ TWILIO_FROM  = os.environ.get("TWILIO_FROM")
 TWILIO_TO    = os.environ.get("TWILIO_TO")
 
 # ─── SMS state ────────────────────────────────────────────────────────────────
-# Tracks whether we are currently IN an anomaly state per type.
-# SMS fires only on transition: normal→anomaly (onset) and anomaly→normal (recovery)
 previous_anomaly_state: dict[str, bool] = {}
 
 # ─── Persistent log ───────────────────────────────────────────────────────────
-LOG_BUFFER_SIZE = 8640  # 24 hours at 10s intervals
+LOG_BUFFER_SIZE = 8640
 LOG_FILE        = "solaryield_log.json"
 reading_log: deque = deque(maxlen=LOG_BUFFER_SIZE)
 
@@ -62,6 +77,21 @@ def save_log_to_disk():
 
 load_log_from_disk()
 
+# ─── Google Sheets logging ────────────────────────────────────────────────────
+SHEETS_URL = "https://script.google.com/macros/s/AKfycbw2L8MJmkXec7YuZj-H6koqexwdpx66JwFZMx5ZPtqRf-HwCb37dgoUjpD8ZWtT6apE/exec"
+
+def log_to_sheets(entry: dict):
+    try:
+        import urllib.request
+        data = json.dumps(entry).encode("utf-8")
+        req  = urllib.request.Request(
+            SHEETS_URL, data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        logger.error(f"Google Sheets logging failed: {e}")
+
 # ─── SMS helper ───────────────────────────────────────────────────────────────
 def send_sms(body: str):
     try:
@@ -71,48 +101,110 @@ def send_sms(body: str):
     except Exception as e:
         logger.error(f"SMS failed: {e}")
 
-def handle_sms(anomaly_type: str, anomaly: bool, temperature: float,
-               humidity: float, soil_moisture: float, tilt_angle: int):
-    """
-    Fire SMS only on state transitions:
-    - normal → anomaly: onset message
-    - anomaly → normal: recovery message
-    No SMS during sustained anomaly (no spam).
-    """
+def handle_sms(anomaly_type, anomaly, temperature, humidity, soil_moisture, tilt_angle):
     was_anomaly = previous_anomaly_state.get(anomaly_type, False)
-
     if anomaly and not was_anomaly:
-        # Transition: normal → anomaly (ONSET)
         label = anomaly_type.replace("_", " ").title()
-        body = (
+        send_sms(
             f"SolarYield Alert — {label} detected.\n"
-            f"Temp: {temperature:.1f}°C, Humidity: {humidity:.1f}%, "
-            f"Soil: {soil_moisture:.0f}.\n"
+            f"Temp: {temperature:.1f}°C, Humidity: {humidity:.1f}%, Soil: {soil_moisture:.0f}.\n"
             f"Panel tilted to {tilt_angle}° to protect your crop. "
             f"Will notify you when conditions normalise."
         )
-        send_sms(body)
         previous_anomaly_state[anomaly_type] = True
-
     elif not anomaly and was_anomaly:
-        # Transition: anomaly → normal (RECOVERY)
         label = anomaly_type.replace("_", " ").title()
-        body = (
+        send_sms(
             f"SolarYield — {label} resolved.\n"
-            f"Temp: {temperature:.1f}°C, Humidity: {humidity:.1f}%, "
-            f"Soil: {soil_moisture:.0f}.\n"
+            f"Temp: {temperature:.1f}°C, Humidity: {humidity:.1f}%, Soil: {soil_moisture:.0f}.\n"
             f"Panel returned to baseline position. Crops are stable."
         )
-        send_sms(body)
         previous_anomaly_state[anomaly_type] = False
 
-    elif not anomaly and not was_anomaly:
-        # Sustained normal — no SMS
-        pass
+# ─── RF anomaly detection ─────────────────────────────────────────────────────
+def rf_predict(data) -> tuple[int, bool, str]:
+    """
+    Run RF residual-based anomaly detection.
+    Returns (tilt_angle, anomaly_detected, anomaly_type)
+    """
+    bundle = model_bundle
+    rf_models      = bundle['rf_models']
+    thresholds     = bundle['thresholds']
+    target_sensors = bundle['target_sensors']
+    irradiance_gate = bundle['irradiance_gate']
 
-    elif anomaly and was_anomaly:
-        # Sustained anomaly — no SMS (no spam)
-        pass
+    sensor_values = {
+        'temperature':  data.temperature,
+        'humidity':     data.humidity,
+        'lux':          data.lux,
+        'time_sin':     data.time_sin,
+        'time_cos':     data.time_cos,
+    }
+
+    anomalies_detected = {}
+
+    for sensor in target_sensors:
+        rf         = rf_models[sensor]['model']
+        feat_cols  = rf_models[sensor]['features']
+        X          = np.array([[sensor_values[f] for f in feat_cols]])
+        predicted  = rf.predict(X)[0]
+        actual     = sensor_values[sensor]
+        residual   = actual - predicted
+        t          = thresholds[sensor]
+
+        if residual > t['upper_3sigma'] or residual < t['lower_3sigma']:
+            anomalies_detected[sensor] = residual
+
+    # ── Daytime gate — suppress lux anomaly at night ──────────────────────────
+    sg_hour = datetime.now(timezone(timedelta(hours=8))).hour
+    is_daytime = 7 <= sg_hour <= 19
+    if 'lux' in anomalies_detected and not is_daytime:
+        del anomalies_detected['lux']
+
+    # ── Irradiance gate — suppress voltage anomaly in low light ───────────────
+    # (voltage not in RF model yet — handled in threshold layer below)
+
+    if not anomalies_detected:
+        return 5, False, "none"
+
+    # ── Two-layer control policy ──────────────────────────────────────────────
+    # Priority: soil_drought > heat_stress > light_deficiency > voltage_drop
+    if 'temperature' in anomalies_detected and anomalies_detected['temperature'] > 0:
+        return 25, True, "heat_stress"
+    if 'humidity' in anomalies_detected and anomalies_detected['humidity'] < 0:
+        return 20, True, "low_humidity"
+    if 'lux' in anomalies_detected and anomalies_detected['lux'] < 0:
+        # Light below expected — reduce tilt to let more light through
+        if data.lux < irradiance_gate:
+            return 5, False, "irradiance_limited"
+        return 0, True, "light_deficiency"
+    if 'temperature' in anomalies_detected and anomalies_detected['temperature'] < 0:
+        # Temperature anomaly low — unusual, log but no tilt
+        return 5, True, "temp_anomaly_low"
+
+    return 5, True, "multivariate_anomaly"
+
+
+# ─── Threshold fallback ───────────────────────────────────────────────────────
+def threshold_predict(data) -> tuple[int, bool, str]:
+    sg_hour    = datetime.now(timezone(timedelta(hours=8))).hour
+    is_daytime = 7 <= sg_hour <= 19
+    LOW_LIGHT_THRESHOLD = model_bundle['irradiance_gate'] if model_bundle else 5000
+
+    if data.temperature > 35:
+        return 25, True, "heat_stress"
+    elif data.soil_moisture < 1500:
+        return 25, True, "soil_drought"
+    elif data.humidity < 50:
+        return 20, True, "low_humidity"
+    elif 0 < data.lux < 3000 and is_daytime:
+        return 0, True, "light_deficiency"
+    elif data.voltage < 3.0 and data.lux > LOW_LIGHT_THRESHOLD:
+        return 5, True, "voltage_drop"
+    elif data.voltage < 3.0 and data.lux <= LOW_LIGHT_THRESHOLD:
+        logger.info("Irradiance gate activated")
+        return 5, False, "irradiance_limited"
+    return 5, False, "none"
 
 # ─── Request schema ───────────────────────────────────────────────────────────
 class SensorData(BaseModel):
@@ -165,24 +257,21 @@ def get_growth():
 # ─── Health check ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "SolarYield API running", "log_entries": len(reading_log)}
+    return {
+        "status": "SolarYield API running",
+        "log_entries": len(reading_log),
+        "rf_model": "loaded" if RF_MODEL_AVAILABLE else "threshold fallback",
+    }
 
 # ─── Log endpoint ─────────────────────────────────────────────────────────────
 @app.get("/log")
 def get_log(n: int = 360):
     n = min(n, LOG_BUFFER_SIZE)
-    entries = list(reading_log)[-n:]
-    return {"count": len(entries), "readings": entries}
+    return {"count": len(reading_log), "readings": list(reading_log)[-n:]}
 
-# ─── CSV export endpoint ──────────────────────────────────────────────────────
-@app.delete("/clear-log")
-def clear_log():
-    reading_log.clear()
-    save_log_to_disk()
-    return {"status": "log cleared", "entries_remaining": 0}
+# ─── CSV export ───────────────────────────────────────────────────────────────
 @app.get("/export")
 def export_csv():
-    """Download full log as CSV for daily backup."""
     entries = list(reading_log)
     if not entries:
         return {"error": "No data to export"}
@@ -197,55 +286,33 @@ def export_csv():
         headers={"Content-Disposition": "attachment; filename=solaryield_log.csv"}
     )
 
+# ─── Clear log ────────────────────────────────────────────────────────────────
+@app.delete("/clear-log")
+def clear_log():
+    reading_log.clear()
+    save_log_to_disk()
+    return {"status": "log cleared", "entries_remaining": 0}
+
 # ─── Predict endpoint ─────────────────────────────────────────────────────────
 @app.post("/predict")
 def predict(data: SensorData):
-    tilt         = 5
-    anomaly      = False
-    anomaly_type = "none"
-
     logger.info(
         f"Temp: {data.temperature:.1f}C, Hum: {data.humidity:.1f}%, "
         f"Soil: {data.soil_moisture}, Lux: {data.lux:.1f}, "
         f"V: {data.voltage:.2f}, mA: {data.current:.1f}"
     )
 
-    LOW_LIGHT_THRESHOLD = 5000  # update after baseline
+    # ── Use RF model if available, otherwise threshold fallback ───────────────
+    if RF_MODEL_AVAILABLE:
+        tilt, anomaly, anomaly_type = rf_predict(data)
+        controller = "RF"
+    else:
+        tilt, anomaly, anomaly_type = threshold_predict(data)
+        controller = "threshold"
 
-    # ── Control policy ────────────────────────────────────────────────────────
-    # TODO: Replace with RF model after baseline collection
-    if data.temperature > 35:
-        tilt         = 25
-        anomaly      = True
-        anomaly_type = "heat_stress"
+    logger.info(f"[{controller}] {anomaly_type} → tilt {tilt}°")
 
-    elif data.soil_moisture < 1500:
-        tilt         = 25
-        anomaly      = True
-        anomaly_type = "soil_drought"
-
-    elif data.humidity < 50:
-        tilt         = 20
-        anomaly      = True
-        anomaly_type = "low_humidity"
-
-    elif 0 < data.lux < 3000:
-        tilt         = 0
-        anomaly      = True
-        anomaly_type = "light_deficiency"
-
-    elif data.voltage < 3.0 and data.lux > LOW_LIGHT_THRESHOLD:
-        tilt         = 5
-        anomaly      = True
-        anomaly_type = "voltage_drop"
-
-    elif data.voltage < 3.0 and data.lux <= LOW_LIGHT_THRESHOLD:
-        tilt         = 5
-        anomaly      = False
-        anomaly_type = "irradiance_limited"
-        logger.info("Irradiance gate activated")
-
-    # ── SMS — onset and recovery only ────────────────────────────────────────
+    # ── SMS ───────────────────────────────────────────────────────────────────
     handle_sms(anomaly_type, anomaly,
                data.temperature, data.humidity, data.soil_moisture, tilt)
 
@@ -263,27 +330,21 @@ def predict(data: SensorData):
         "anomaly_detected": anomaly,
         "anomaly_type":     anomaly_type,
         "power_mw":         round(data.voltage * data.current, 2),
+        "controller":       controller,
     }
     reading_log.append(log_entry)
 
-   # Send to Google Sheets
-    try:
-     gs_data = json.dumps(log_entry).encode("utf-8")
-     req = urllib.request.Request(
-        "https://script.google.com/macros/s/AKfycbw2L8MJmkXec7YuZj-H6koqexwdpx66JwFZMx5ZPtqRf-HwCb37dgoUjpD8ZWtT6apE/exec",
-        data=gs_data,
-        headers={"Content-Type": "application/json"}
-     )
-     urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-      logger.error(f"Google Sheets logging failed: {e}")
-
+    # Save to disk every 60 readings
     if len(reading_log) % 60 == 0:
         save_log_to_disk()
+
+    # Log to Google Sheets
+    log_to_sheets(log_entry)
 
     return {
         "tilt_angle":       tilt,
         "anomaly_detected": anomaly,
         "anomaly_type":     anomaly_type,
         "send_sms":         anomaly,
+        "controller":       controller,
     }
