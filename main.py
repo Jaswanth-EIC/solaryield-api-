@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from collections import deque
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from twilio.rest import Client
 import io
@@ -49,8 +49,27 @@ TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN")
 TWILIO_FROM  = os.environ.get("TWILIO_FROM")
 TWILIO_TO    = os.environ.get("TWILIO_TO")
 
+# ─── Mode control password ─────────────────────────────────────────────────────
+MODE_PASSWORD = os.environ.get("MODE_PASSWORD")
+# Set this in Render's environment variables, same place as TWILIO_SID.
+# Never hardcode it here — this file is in a public repo.
+
 # ─── SMS state ────────────────────────────────────────────────────────────────
 previous_anomaly_state: dict[str, bool] = {}
+
+# ─── Friendly, non-technical labels for SMS (no jargon, no degree symbols) ────
+FRIENDLY_LABELS = {
+    "heat_stress":          "Heat stress",
+    "low_humidity":         "Low humidity",
+    "light_deficiency":     "Low light",
+    "soil_drought":         "Dry soil",
+    "voltage_drop":         "Low power",
+    "multivariate_anomaly": "Unusual conditions",
+    "temp_anomaly_low":     "Unusual conditions",
+}
+
+def friendly_label(anomaly_type: str) -> str:
+    return FRIENDLY_LABELS.get(anomaly_type, anomaly_type.replace("_", " ").title())
 
 # ─── Persistent log ───────────────────────────────────────────────────────────
 LOG_BUFFER_SIZE = 8640
@@ -104,20 +123,15 @@ def send_sms(body: str):
 def handle_sms(anomaly_type, anomaly, temperature, humidity, soil_moisture, tilt_angle):
     was_anomaly = previous_anomaly_state.get(anomaly_type, False)
     if anomaly and not was_anomaly:
-        label = anomaly_type.replace("_", " ").title()
+        label = friendly_label(anomaly_type)
         send_sms(
-            f"SolarYield Alert — {label} detected.\n"
-            f"Temp: {temperature:.1f}°C, Humidity: {humidity:.1f}%, Soil: {soil_moisture:.0f}.\n"
-            f"Panel tilted to {tilt_angle}° to protect your crop. "
-            f"Will notify you when conditions normalise."
+            f"SolarYield: {label} detected. Panel auto-tilted to protect your crops."
         )
         previous_anomaly_state[anomaly_type] = True
     elif not anomaly and was_anomaly:
-        label = anomaly_type.replace("_", " ").title()
+        label = friendly_label(anomaly_type)
         send_sms(
-            f"SolarYield — {label} resolved.\n"
-            f"Temp: {temperature:.1f}°C, Humidity: {humidity:.1f}%, Soil: {soil_moisture:.0f}.\n"
-            f"Panel returned to baseline position. Crops are stable."
+            f"SolarYield: {label} resolved. Panel returned to normal position."
         )
         previous_anomaly_state[anomaly_type] = False
 
@@ -217,6 +231,51 @@ class SensorData(BaseModel):
     time_sin:      float
     time_cos:      float
 
+# ─── Mode state (auto / manual override) ───────────────────────────────────────
+MODE_FILE = "mode_state.json"
+mode_state = {"mode": "auto", "manual_tilt_angle": 5}
+
+def load_mode_from_disk():
+    if os.path.exists(MODE_FILE):
+        try:
+            with open(MODE_FILE, "r") as f:
+                mode_state.update(json.load(f))
+            logger.info(f"Loaded mode state: {mode_state}")
+        except Exception as e:
+            logger.error(f"Failed to load mode state: {e}")
+
+def save_mode_to_disk():
+    try:
+        with open(MODE_FILE, "w") as f:
+            json.dump(mode_state, f)
+    except Exception as e:
+        logger.error(f"Failed to save mode state: {e}")
+
+load_mode_from_disk()
+
+class ModeUpdate(BaseModel):
+    mode: str
+    manual_tilt_angle: int = 5
+    password: str
+
+@app.get("/mode")
+def get_mode():
+    return mode_state
+
+@app.post("/mode")
+def set_mode(update: ModeUpdate):
+    if not MODE_PASSWORD:
+        return JSONResponse(status_code=500, content={"error": "MODE_PASSWORD not configured on server"})
+    if update.password != MODE_PASSWORD:
+        return JSONResponse(status_code=401, content={"error": "Incorrect password"})
+    if update.mode not in ("auto", "manual"):
+        return JSONResponse(status_code=400, content={"error": "mode must be 'auto' or 'manual'"})
+    mode_state["mode"] = update.mode
+    mode_state["manual_tilt_angle"] = max(0, min(30, update.manual_tilt_angle))
+    save_mode_to_disk()
+    logger.info(f"Mode changed to {mode_state}")
+    return mode_state
+
 # ─── Growth log ───────────────────────────────────────────────────────────────
 GROWTH_FILE = "growth_log.json"
 growth_log  = []
@@ -302,8 +361,13 @@ def predict(data: SensorData):
         f"V: {data.voltage:.2f}, mA: {data.current:.1f}"
     )
 
-    # ── Use RF model if available, otherwise threshold fallback ───────────────
-    if RF_MODEL_AVAILABLE:
+    # ── Manual override takes priority over RF/threshold ──────────────────────
+    if mode_state["mode"] == "manual":
+        tilt = mode_state["manual_tilt_angle"]
+        anomaly = False
+        anomaly_type = "manual"
+        controller = "manual"
+    elif RF_MODEL_AVAILABLE:
         tilt, anomaly, anomaly_type = rf_predict(data)
         controller = "RF"
     else:
